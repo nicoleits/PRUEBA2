@@ -1,0 +1,685 @@
+# Configurar pandas para evitar downcasting silencioso
+# 📦 Carga de librerías y definición de funciones
+import pandas as pd
+from pathlib import Path
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from datetime import datetime
+import numpy as np
+import pvlib
+import os
+from pvlib.solarposition import get_solarposition
+import PySAM.Pvwattsv7 as pv
+import PySAM.Lcoefcr as Lcoefcr
+
+DATOS_LIMPIOS_DIR = Path('datos_limpios')
+DATOS_LIMPIOS_DIR.mkdir(exist_ok=True)
+
+pd.set_option('future.no_silent_downcasting', True)
+
+# Funciones
+
+def transformar_a_tmy_con_metadatos(csv_path, output_path, metadata_dict):
+    """
+    Transforma un archivo CSV con datos horarios en un TMY artificial con metadatos en el encabezado.
+    """
+    # Leer el archivo CSV
+    df = pd.read_csv(csv_path)
+
+    # Eliminar columna 'datetime' si existe
+    if 'datetime' in df.columns:
+        df = df.drop(columns=['datetime'])
+
+    # Ordenar cronológicamente y recortar o completar a 8760 filas
+    df = df.sort_values(by=["Month", "Day", "Hour", "Minute"])
+    df = df.reset_index(drop=True)
+    df = df.iloc[:8760]  # en caso de que tenga más filas
+
+    # Asignar un año artificial constante
+    df['Year'] = 1990
+
+    # Reordenar columnas: primero las de fecha
+    columnas_fecha = ['Year', 'Month', 'Day', 'Hour', 'Minute']
+    otras = [c for c in df.columns if c not in columnas_fecha]
+    df = df[columnas_fecha + otras]
+
+    # Escribir archivo con las tres primeras líneas de metadatos
+    with open(output_path, "w", encoding="utf-8") as f:
+        # Línea 1: encabezados de metadatos
+        f.write("Source,Location ID,City,State,Country,Latitude,Longitude,Time Zone,Elevation\n")
+        # Línea 2: valores de metadatos
+        f.write(",".join(str(metadata_dict[k]) for k in [
+            "Source", "Location ID", "City", "State", "Country",
+            "Latitude", "Longitude", "Time Zone", "Elevation"
+        ]) + "\n")
+        # Línea 3: encabezado de columnas de datos
+        f.write(",".join(df.columns) + "\n")
+        # Resto de datos
+        df.to_csv(f, index=False, header=False)
+
+    return df
+
+
+def plot_tmy_data(df, location, output_dir="plots", is_clean=False):
+    """
+    Genera gráficos de los datos TMY artificiales.
+    """
+    # Crear directorio para gráficos si no existe
+    Path(output_dir).mkdir(exist_ok=True)
+
+    # Configurar estilo de gráficos
+    plt.style.use('default')
+
+    # Crear figura con tres subplots
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 15))
+    title_suffix = " (Datos Limpios)" if is_clean else ""
+    fig.suptitle(f'Radiación Solar por Hora - {location}{title_suffix}', fontsize=16, y=0.95)
+
+    # Crear fechas para el eje x
+    dates = [datetime(1990, int(row['Month']), int(row['Day']), int(row['Hour'])) 
+             for _, row in df.iterrows()]
+
+    # Graficar cada componente en su propio subplot
+    ax1.plot(dates, df['GHI'], 'b-', linewidth=1, alpha=0.7)
+    ax1.set_title('Radiación Global Horizontal (GHI)', fontsize=12)
+    ax1.set_ylabel('GHI (W/m²)', fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_ylim(0, 1300)  # Establecer límite superior para GHI
+
+    ax2.plot(dates, df['DNI'], 'r-', linewidth=1, alpha=0.7)
+    ax2.set_title('Radiación Normal Directa (DNI)', fontsize=12)
+    ax2.set_ylabel('DNI (W/m²)', fontsize=10)
+    ax2.grid(True, alpha=0.3)
+    ax2.set_ylim(0, 1300)  # Establecer límite superior para DNI
+
+    ax3.plot(dates, df['DHI'], 'g-', linewidth=1, alpha=0.7)
+    ax3.set_title('Radiación Horizontal Difusa (DHI)', fontsize=12)
+    ax3.set_ylabel('DHI (W/m²)', fontsize=10)
+    ax3.set_xlabel('Mes', fontsize=10)
+    ax3.grid(True, alpha=0.3)
+    ax3.set_ylim(0, 600)  # Establecer límite superior para DHI
+
+    # Configurar formato del eje x para todos los subplots
+    for ax in [ax1, ax2, ax3]:
+        ax.xaxis.set_major_locator(mdates.MonthLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
+
+    # Ajustar layout y guardar
+    plt.tight_layout()
+    suffix = "_clean" if is_clean else ""
+    plt.savefig(f'{output_dir}/{location.lower()}_tmy_plots{suffix}.png', 
+                bbox_inches='tight', dpi=300)
+    plt.close()
+
+
+def generate_eda_report(df, location, output_dir="reports", df_final=None):
+    """
+    Genera un informe EDA con análisis de valores faltantes y outliers.
+    """
+    # Crear directorio para informes si no existe
+    Path(output_dir).mkdir(exist_ok=True)
+
+    # Crear archivo de informe
+    report_path = Path(output_dir) / f"{location.lower()}_eda_report.txt"
+    print(f"[DEBUG] Generando reporte EDA en: {report_path}")
+
+    # Definir límites de outliers
+    outlier_limits = {
+        'GHI': 1200,  # Actualizado para coincidir con limpiar_TMY_completo
+        'DNI': 1300,
+        'DHI': 600
+    }
+
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write(f"=== Informe EDA - {location} ===\n\n")
+
+        # 1. Información general
+        f.write("1. INFORMACIÓN GENERAL\n")
+        f.write("-" * 50 + "\n")
+        f.write(f"Número total de registros: {len(df)}\n")
+        f.write(f"Período: {df['Month'].min()}/{df['Day'].min()} - {df['Month'].max()}/{df['Day'].max()}\n\n")
+
+        # 2. Análisis de valores faltantes
+        f.write("2. ANÁLISIS DE VALORES FALTANTES\n")
+        f.write("-" * 50 + "\n")
+        nan_counts = df[['GHI', 'DNI', 'DHI']].isna().sum()
+        nan_percentages = (nan_counts / len(df)) * 100
+
+        for col in ['GHI', 'DNI', 'DHI']:
+            f.write(f"{col}:\n")
+            f.write(f"  - Número de valores faltantes: {nan_counts[col]}\n")
+            f.write(f"  - Porcentaje de valores faltantes: {nan_percentages[col]:.2f}%\n")
+
+            # Análisis de secuencias de NaN
+            if nan_counts[col] > 0:
+                nan_sequences = df[col].isna().astype(int).groupby(
+                    (df[col].isna().astype(int).diff() != 0).cumsum()
+                ).cumsum()
+                max_consecutive = nan_sequences.max()
+                f.write(f"  - Máxima secuencia de NaN consecutivos: {max_consecutive}\n")
+        f.write("\n")
+
+        # 3. Análisis de Outliers
+        f.write("3. ANÁLISIS DE OUTLIERS\n")
+        f.write("-" * 50 + "\n")
+        f.write("Criterios de outliers:\n")
+        f.write("- GHI > 1200 W/m² o < 0\n")  # Actualizado
+        f.write("- DNI > 1300 W/m² o < 0\n")
+        f.write("- DHI > 600 W/m² o < 0\n\n")
+
+        for col in ['GHI', 'DNI', 'DHI']:
+            # Identificar outliers (valores negativos o mayores al límite)
+            neg_outliers = df[df[col] < 0][col]
+            high_outliers = df[df[col] > outlier_limits[col]][col]
+            total_outliers = len(neg_outliers) + len(high_outliers)
+
+            f.write(f"{col}:\n")
+            f.write(f"  - Número total de outliers: {total_outliers}\n")
+            f.write(f"  - Porcentaje de outliers: {(total_outliers/len(df))*100:.2f}%\n")
+
+            if len(neg_outliers) > 0:
+                f.write(f"  - Outliers negativos: {len(neg_outliers)} ({len(neg_outliers)/total_outliers*100:.2f}% del total de outliers)\n")
+                f.write(f"    * Valor mínimo: {neg_outliers.min():.2f} W/m²\n")
+                f.write(f"    * Valor máximo negativo: {neg_outliers.max():.2f} W/m²\n")
+                f.write(f"    * Media de outliers negativos: {neg_outliers.mean():.2f} W/m²\n")
+
+            if len(high_outliers) > 0:
+                f.write(f"  - Outliers altos: {len(high_outliers)} ({len(high_outliers)/total_outliers*100:.2f}% del total de outliers)\n")
+                f.write(f"    * Valor mínimo: {high_outliers.min():.2f} W/m²\n")
+                f.write(f"    * Valor máximo: {high_outliers.max():.2f} W/m²\n")
+                f.write(f"    * Media de outliers altos: {high_outliers.mean():.2f} W/m²\n")
+
+            # Análisis temporal de outliers
+            if total_outliers > 0:
+                f.write("  - Distribución temporal de outliers:\n")
+                for month in range(1, 13):
+                    month_outliers = len(df[(df['Month'] == month) & 
+                                          ((df[col] < 0) | (df[col] > outlier_limits[col]))])
+                    if month_outliers > 0:
+                        f.write(f"    * Mes {month}: {month_outliers} outliers\n")
+        f.write("\n")
+        
+        # 4. Estadísticas descriptivas (excluyendo outliers)
+        f.write("4. ESTADÍSTICAS DESCRIPTIVAS (EXCLUYENDO OUTLIERS)\n")
+        f.write("-" * 50 + "\n")
+        for col in ['GHI', 'DNI', 'DHI']:
+            f.write(f"{col}:\n")
+            # Filtrar valores válidos (no outliers)
+            valid_data = df[(df[col] >= 0) & (df[col] <= outlier_limits[col])][col]
+            stats = valid_data.describe()
+            f.write(f"  - Media: {stats['mean']:.2f} W/m²\n")
+            f.write(f"  - Desviación estándar: {stats['std']:.2f} W/m²\n")
+            f.write(f"  - Mínimo: {stats['min']:.2f} W/m²\n")
+            f.write(f"  - Máximo: {stats['max']:.2f} W/m²\n")
+            f.write(f"  - Mediana: {stats['50%']:.2f} W/m²\n")
+            f.write(f"  - Q1 (25%): {stats['25%']:.2f} W/m²\n")
+            f.write(f"  - Q3 (75%): {stats['75%']:.2f} W/m²\n")
+        f.write("\n")
+
+        # 5. Recomendaciones
+        f.write("5. RECOMENDACIONES\n")
+        f.write("-" * 50 + "\n")
+        for col in ['GHI', 'DNI', 'DHI']:
+            f.write(f"{col}:\n")
+            if nan_counts[col] > 0:
+                f.write(f"  - Considerar interpolación para {nan_counts[col]} valores faltantes ")
+                if 'max_consecutive' in locals() and max_consecutive > 4:
+                    f.write(f"(¡Alerta! Hay secuencias de hasta {max_consecutive} NaN consecutivos)\n")
+                else:
+                    f.write("(secuencias cortas, adecuadas para interpolación)\n")
+
+            neg_count = len(df[df[col] < 0])
+            high_count = len(df[df[col] > outlier_limits[col]])
+            if neg_count > 0 or high_count > 0:
+                f.write(f"  - Reemplazar {neg_count + high_count} outliers:\n")
+                if neg_count > 0:
+                    f.write(f"    * {neg_count} valores negativos con 0\n")
+                if high_count > 0:
+                    f.write(f"    * {high_count} valores > {outlier_limits[col]} W/m² con {outlier_limits[col]} W/m²\n")
+                f.write(f"  - Revisar la calidad de los datos en los meses con mayor concentración de outliers\n")
+
+        f.write("\nRecomendaciones generales:\n")
+        f.write("1. Reemplazar todos los valores negativos con 0\n")
+        f.write("2. Limitar los valores máximos a los umbrales físicos:\n")
+        f.write("   - GHI: 1200 W/m²\n")  # Actualizado
+        f.write("   - DNI: 1300 W/m²\n")
+        f.write("   - DHI: 600 W/m²\n")
+        f.write("3. Considerar la interpolación solo para secuencias cortas de NaN (≤ 4 horas)\n")
+        f.write("4. Revisar la calidad de los datos en los meses con mayor concentración de outliers\n")
+        f.write("5. Documentar el proceso de limpieza y las decisiones tomadas para el manejo de outliers\n")
+        # --- SECCIÓN DE RESULTADOS FINALES ---
+        if df_final is not None:
+            print(f"[DEBUG] Escribiendo resultados finales para {location}...")
+            f.write("\n=== RESULTADOS FINALES DE LA LIMPIEZA ===\n")
+            outlier_limits = {'GHI': 1200, 'DNI': 1300, 'DHI': 600}
+            for col in ['GHI', 'DNI', 'DHI']:
+                neg_outliers = len(df_final[df_final[col] < 0])
+                high_outliers = len(df_final[df_final[col] > outlier_limits[col]])
+                total_outliers = neg_outliers + high_outliers
+                nans = df_final[col].isna().sum()
+                f.write(f"{col}: {total_outliers} outliers (Negativos: {neg_outliers}, Altos: {high_outliers}), {nans} NaNs\n")
+
+def analisis_estacional(df, location):
+    """
+    Realiza un análisis estacional de los datos solares.
+    """
+    print(f"\n=== ANÁLISIS ESTACIONAL - {location} ===")
+    print("=" * 50)
+
+    # Definir estaciones
+    estaciones = {
+        'Verano': [12, 1, 2],
+        'Otoño': [3, 4, 5],
+        'Invierno': [6, 7, 8],
+        'Primavera': [9, 10, 11]
+    }
+
+    # Crear DataFrame para almacenar estadísticas estacionales
+    stats_estacionales = pd.DataFrame(index=estaciones.keys(), 
+                                    columns=['GHI Promedio', 'DNI Promedio', 'DHI Promedio',
+                                            'GHI Máximo', 'DNI Máximo', 'DHI Máximo',
+                                            'Horas de Sol', 'Energía Total'])
+
+    # Calcular estadísticas por estación
+    for estacion, meses in estaciones.items():
+        df_estacion = df[df['Month'].isin(meses)]
+
+        # Estadísticas básicas
+        stats_estacionales.loc[estacion, 'GHI Promedio'] = df_estacion['GHI'].mean()
+        stats_estacionales.loc[estacion, 'DNI Promedio'] = df_estacion['DNI'].mean()
+        stats_estacionales.loc[estacion, 'DHI Promedio'] = df_estacion['DHI'].mean()
+
+        stats_estacionales.loc[estacion, 'GHI Máximo'] = df_estacion['GHI'].max()
+        stats_estacionales.loc[estacion, 'DNI Máximo'] = df_estacion['DNI'].max()
+        stats_estacionales.loc[estacion, 'DHI Máximo'] = df_estacion['DHI'].max()
+
+        # Horas de sol y energía
+        stats_estacionales.loc[estacion, 'Horas de Sol'] = len(df_estacion[df_estacion['GHI'] > 0])
+        stats_estacionales.loc[estacion, 'Energía Total'] = df_estacion['GHI'].sum() / 1000
+
+    # Mostrar estadísticas estacionales
+    print("\nEstadísticas por Estación:")
+    print(stats_estacionales.round(2))
+
+
+def marcar_outliers_nan(df):
+    """
+    Marca como NaN los valores físicamente inválidos en GHI, DNI y DHI.
+    - GHI < 0 o GHI > 1400
+    - DNI < 0 o DNI > 1300
+    - DHI < 0 o DHI > 400
+    """
+    df = df.copy()
+    df['GHI'] = df['GHI'].mask((df['GHI'] < 0) | (df['GHI'] > 1400))
+    df['DNI'] = df['DNI'].mask((df['DNI'] < 0) | (df['DNI'] > 1300))
+    df['DHI'] = df['DHI'].mask((df['DHI'] < 0) | (df['DHI'] > 600))
+    return df
+
+
+def limpiar_TMY_completo(archivo_entrada, archivo_salida, max_ghi=1400, max_dni=1300, max_dhi=600, interp_limit=6, location=None):
+    """
+    Limpia GHI, DNI, DHI, Tdry, Tdew, RH y Pres de un archivo TMY artificial y guarda un solo archivo limpio con metadatos.
+    """
+    # Leer metadatos
+    with open(archivo_entrada, 'r', encoding='utf-8') as f:
+        metadatos = [next(f) for _ in range(2)]
+    # Leer datos desde la tercera línea
+    df = pd.read_csv(archivo_entrada, skiprows=2)
+    # Crear columna datetime y usar como índice
+    df["datetime"] = pd.to_datetime(df[["Year", "Month", "Day", "Hour", "Minute"]])
+    df = df.set_index("datetime")
+
+    # Ajustar límites según la ubicación
+    if location == "Vallenar":
+        max_ghi = 1200
+        ghi_high_season = 1150
+    else:
+        max_ghi = 1400
+        ghi_high_season = 1250
+
+    # Limpiar GHI con límites dependientes del mes y ubicación
+    df["GHI"] = df["GHI"].mask(
+        ((df["Month"].between(3, 10)) & (df["GHI"] >= ghi_high_season)) |  # Límite para meses de alta radiación
+        ((~df["Month"].between(3, 10)) & (df["GHI"] > max_ghi)) |  # Límite general
+        (df["GHI"] < 0)
+    )
+    df["GHI"] = df["GHI"].interpolate(method='linear', limit=interp_limit, limit_direction='both')
+
+    # Limpiar DNI
+    df["DNI"] = df["DNI"].mask((df["DNI"] < 0) | (df["DNI"] > max_dni))
+    df["DNI"] = df["DNI"].interpolate(method='linear', limit=interp_limit, limit_direction='both')
+
+    # Limpiar DHI con chequeos físicos avanzados
+    # Calcular posición solar para validación física
+    lat = -26.2533 if location == "Salvador" else -22.4661 if location == "Calama" else -28.5766
+    lon = -69.0522 if location == "Salvador" else -68.9244 if location == "Calama" else -70.7601
+    solar_position = get_solarposition(df.index, latitude=lat, longitude=lon)
+    cos_zenith = np.cos(np.radians(solar_position["zenith"]))
+    dhi_est = (df["GHI"] - df["DNI"] * cos_zenith).clip(lower=0)
+
+    cond_invalid_dhi = (
+        (df["DHI"] < 0) |
+        (df["DHI"] > max_dhi) |
+        (df["DHI"] > df["GHI"]) |
+        (df["DHI"] > dhi_est + 30) |
+        (df["DHI"] > 0.95 * df["GHI"]) |
+        ((solar_position["zenith"] > 90) & (df["DHI"] > 5))
+    )
+    df.loc[cond_invalid_dhi, "DHI"] = np.nan
+
+    # Interpolación robusta para DHI
+    def interpolar_robusto(serie, limit):
+        nan_groups = serie.isna().astype(int).groupby(serie.notna().astype(int).cumsum()).sum()
+        if (nan_groups > limit).any():
+            mask = serie.isna()
+            for idx, size in nan_groups[nan_groups > limit].items():
+                mask[mask.groupby(mask.cumsum()).ngroup() == idx] = False
+            serie_interp = serie.interpolate(method='linear', limit=limit, limit_direction='both')
+            serie[mask] = serie_interp[mask]
+            return serie
+        else:
+            return serie.interpolate(method='linear', limit=limit, limit_direction='both')
+
+    df["DHI"] = interpolar_robusto(df["DHI"], interp_limit)
+
+    # Limpiar Tdry, Tdew, RH y Pres
+    # Definir límites más realistas para cada parámetro
+    temp_limits = {
+        'Tdry': (-10, 50),  # Limitar entre -10°C y 50°C
+        'Tdew': (-10, 50),  # Limitar entre -10°C y 50°C
+        'RH': (1, 100),     # Forzar al rango físico [1%, 100%]
+        'Pres': (760, 790)  # Limitar entre 760 y 790 hPa
+    }
+
+    for param, (min_val, max_val) in temp_limits.items():
+        df[param] = df[param].mask((df[param] < min_val) | (df[param] > max_val))
+        df[param] = df[param].interpolate(method='linear', limit=interp_limit, limit_direction='both')
+
+    # Interpolación para corregir NaNs
+    for col in ['GHI', 'DNI', 'DHI', 'Tdry', 'Tdew', 'RH', 'Pres']:
+        df[col] = df[col].interpolate(method='linear', limit_direction='both')
+
+    # Opcional: Rellenar cualquier NaN restante con la media de la columna
+    df.fillna(df.mean(), inplace=True)
+
+    # Restaurar columnas separadas
+    df = df.reset_index()
+    df["Year"] = df["datetime"].dt.year
+    df["Month"] = df["datetime"].dt.month
+    df["Day"] = df["datetime"].dt.day
+    df["Hour"] = df["datetime"].dt.hour
+    df["Minute"] = df["datetime"].dt.minute
+
+    # Reordenar columnas
+    columnas_fecha = ["Year", "Month", "Day", "Hour", "Minute"]
+    columnas_finales = columnas_fecha + [col for col in df.columns if col not in columnas_fecha + ["datetime"]]
+    df = df[columnas_finales]
+
+    # --- NUEVOS OUTLIERS ESPECÍFICOS POR UBICACIÓN Y MES ---
+    if location == "Vallenar":
+        # GHI > 1000 entre abril y agosto
+        df["GHI"] = df["GHI"].mask((df["Month"].between(4, 8)) & (df["GHI"] > 1000))
+        # DNI > 1150 todo el año
+        df["DNI"] = df["DNI"].mask(df["DNI"] > 1150)
+    elif location == "Calama":
+        # GHI > 1000 entre mayo y julio
+        df["GHI"] = df["GHI"].mask((df["Month"].between(5, 7)) & (df["GHI"] > 1000))
+        # DNI > 1200 todo el año
+        df["DNI"] = df["DNI"].mask(df["DNI"] > 1200)
+    elif location == "Salvador":
+        # GHI > 1100 entre abril y agosto
+        df["GHI"] = df["GHI"].mask((df["Month"].between(4, 8)) & (df["GHI"] > 1100))
+    # --- FIN NUEVOS OUTLIERS ---
+
+    # Después de limpiar los datos
+    df_limpio = df  # Asegúrate de que df_limpio esté definido
+    revisar_outliers_final(df_limpio, location)
+
+    # Guardar nuevo archivo con metadatos originales
+    with open(archivo_salida, 'w', encoding='utf-8') as f:
+        f.writelines(metadatos)
+        f.write(",".join(df.columns) + "\n")
+        df.to_csv(f, index=False, header=False)
+    print(f"✅ Archivo limpio guardado en: {archivo_salida}")
+
+
+def revisar_outliers_final(df, location):
+    """
+    Revisa la existencia de outliers y NaNs en los datos limpios.
+    """
+    print(f"\n=== REVISIÓN FINAL DE OUTLIERS Y NaNs - {location} ===")
+    outlier_limits = {'GHI': 1200, 'DNI': 1300, 'DHI': 600}  # Límites de outliers
+
+    for col in ['GHI', 'DNI', 'DHI']:
+        neg_outliers = len(df[df[col] < 0])
+        high_outliers = len(df[df[col] > outlier_limits[col]])
+        total_outliers = neg_outliers + high_outliers
+        nans = df[col].isna().sum()
+        print(f"{col}: {total_outliers} outliers, {nans} NaNs")
+        if total_outliers > 0:
+            print(f"  - Negativos: {neg_outliers}")
+            print(f"  - Altos: {high_outliers}")
+        if nans > 0:
+            print(f"  - NaNs: {nans}")
+
+
+def generar_resumen_comparativo(dfs, locations):
+    """
+    Genera un resumen comparativo del EDA para todas las ubicaciones.
+    """
+    print("\n=== RESUMEN COMPARATIVO DE DATOS SOLARES ===")
+    print("=" * 50)
+
+    # Análisis de valores faltantes
+    print("\nAnálisis de Valores Faltantes:")
+    for df, location in zip(dfs, locations):
+        nan_counts = df[['GHI', 'DNI', 'DHI']].isna().sum()
+        print(f"\n{location}:")
+        for col in ['GHI', 'DNI', 'DHI']:
+            print(f"  {col}: {nan_counts[col]} valores faltantes ({(nan_counts[col]/len(df))*100:.2f}%)")
+
+    # Análisis de outliers
+    print("\nAnálisis de Outliers:")
+    outlier_limits = {'GHI': 1200, 'DNI': 1300, 'DHI': 400}  # Actualizado
+    for df, location in zip(dfs, locations):
+        print(f"\n{location}:")
+        for col in ['GHI', 'DNI', 'DHI']:
+            neg_outliers = len(df[df[col] < 0])
+            high_outliers = len(df[df[col] > outlier_limits[col]])
+            total_outliers = neg_outliers + high_outliers
+            print(f"  {col}: {total_outliers} outliers ({(total_outliers/len(df))*100:.2f}%)")
+            if total_outliers > 0:
+                print(f"    - Negativos: {neg_outliers}")
+                print(f"    - Altos: {high_outliers}")
+
+
+def reconstruir_TMY_con_fechas_originales(archivo_corrupto, archivo_limpio, archivo_salida):
+    """
+    Genera un nuevo archivo TMY limpio con los años y meses originales del archivo fuente,
+    pero con los valores limpios. Mantiene los metadatos y el encabezado.
+    """
+    # Leer datos limpios
+    df_limpio = pd.read_csv(archivo_limpio, skiprows=2)
+    # Leer datos originales (sin metadatos)
+    df_original = pd.read_csv(archivo_corrupto)
+    # Reemplazar columnas de fecha por las originales
+    for col in ['Year', 'Month', 'Day', 'Hour', 'Minute']:
+        if col in df_original.columns and col in df_limpio.columns:
+            df_limpio[col] = df_original[col].values
+    # Reordenar columnas para mantener el formato
+    columnas_fecha = ['Year', 'Month', 'Day', 'Hour', 'Minute']
+    columnas_finales = columnas_fecha + [col for col in df_limpio.columns if col not in columnas_fecha]
+    df_limpio = df_limpio[columnas_finales]
+    # Leer metadatos (primeras 3 líneas del archivo limpio)
+    with open(archivo_limpio, 'r', encoding='utf-8') as f:
+        metadatos = [next(f) for _ in range(3)]
+    # Guardar el nuevo archivo
+    with open(archivo_salida, 'w', encoding='utf-8') as f:
+        f.writelines(metadatos)
+        df_limpio.to_csv(f, index=False, header=False)
+    print(f"✅ Archivo TMY limpio con fechas originales guardado en: {archivo_salida}")
+
+
+def scan_nan_gaps(df):
+    """
+    Muestra cuántos NaN y los huecos más largos en GHI, DNI, DHI.
+    """
+    for col in ['GHI', 'DNI', 'DHI']:
+        nan_count = df[col].isna().sum()
+        if nan_count > 0:
+            nan_sequences = df[col].isna().astype(int).groupby(
+                (df[col].isna().astype(int).diff() != 0).cumsum()
+            ).cumsum()
+            max_consecutive = nan_sequences.max()
+            print(f"{col}: {nan_count} NaNs, Max gap: {max_consecutive} hours")
+        else:
+            print(f"{col}: No NaNs")
+
+
+def fill_nan_hierarchical(df):
+    """
+    1. Interpola huecos ≤ 3 h
+    2. Rellena lo restante con el promedio Mes-Hora
+    3. Si aún falta, con el promedio anual por Hora
+    """
+    # Interpolación para huecos pequeños
+    df.interpolate(method='linear', limit=3, limit_direction='both', inplace=True)
+
+    # Rellenar con percentil 75 Mes-Hora
+    for col in ['GHI', 'DNI', 'DHI']:
+        if df[col].isna().sum() > 0:
+            df[col] = df.groupby(['Month', 'Hour'])[col].transform(lambda x: x.fillna(x.quantile(0.75)))
+
+    # Rellenar con percentil 75 anual por Hora
+    for col in ['GHI', 'DNI', 'DHI']:
+        if df[col].isna().sum() > 0:
+            df[col] = df.groupby('Hour')[col].transform(lambda x: x.fillna(x.quantile(0.75)))
+
+    return df
+
+
+def process_and_save_final_tmy(file_path, output_path):
+    """
+    Lee el archivo CSV, aplica las funciones de manejo de NaN y guarda el resultado.
+    """
+    # Leer el archivo CSV
+    with open(file_path, 'r', encoding='utf-8') as f:
+        metadatos = [next(f) for _ in range(2)]  # Leer las dos primeras líneas de metadatos
+    df = pd.read_csv(file_path, skiprows=2)
+
+    # Poner la columna datetime como índice
+    df['datetime'] = pd.to_datetime(df[['Year', 'Month', 'Day', 'Hour', 'Minute']])
+    df.set_index('datetime', inplace=True)
+
+    # Escanear huecos de NaN
+    print(f"\nEscaneando huecos de NaN en {file_path} antes de llenar:")
+    scan_nan_gaps(df)
+
+    # Llenar NaN jerárquicamente
+    df = fill_nan_hierarchical(df)
+
+    # Escanear nuevamente para confirmar que no quedan NaN
+    print(f"\nEscaneando huecos de NaN en {file_path} después de llenar:")
+    scan_nan_gaps(df)
+
+    # Guardar el resultado con el mismo formato TMY
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.writelines(metadatos)
+        f.write(','.join(df.columns) + '\n')  # Escribir encabezado de columnas
+        df.to_csv(f, index=False, header=False)
+    print(f"✅ Archivo final guardado en: {output_path}")
+
+
+def main_tmy():
+    print("Iniciando procesamiento...")
+    # Definir los metadatos para cada sitio
+    metadatos_salvador = {
+        "Source": "ExpSolar", "Location ID": "00001", "City": "Salvador", "State": "Atacama",
+        "Country": "Chile", "Latitude": -26.2533, "Longitude": -69.0522, "Time Zone": -4, "Elevation": 2280
+    }
+    metadatos_calama = {
+        "Source": "ExpSolar", "Location ID": "00002", "City": "Calama", "State": "Antofagasta",
+        "Country": "Chile", "Latitude": -22.4661, "Longitude": -68.9244, "Time Zone": -4, "Elevation": 2260
+    }
+    metadatos_vallenar = {
+        "Source": "ExpSolar", "Location ID": "00003", "City": "Vallenar", "State": "Atacama",
+        "Country": "Chile", "Latitude": -28.5766, "Longitude": -70.7601, "Time Zone": -4, "Elevation": 441
+    }
+    # Rutas de archivos
+    path_salvador = Path("salvador_corrupted.csv")
+    path_calama = Path("calama_corrupted.csv")
+    path_vallenar = Path("Vallenar_corrupted.csv")
+    # Salidas
+    output_salvador = Path("salvador_TMY_artificial.csv")
+    output_calama = Path("calama_TMY_artificial.csv")
+    output_vallenar = Path("vallenar_TMY_artificial.csv")
+    output_salvador_limpio = Path(DATOS_LIMPIOS_DIR / "salvador_TMY_limpio.csv")
+    output_calama_limpio = Path(DATOS_LIMPIOS_DIR / "calama_TMY_limpio.csv")
+    output_vallenar_limpio = Path(DATOS_LIMPIOS_DIR / "vallenar_TMY_limpio.csv")
+
+    # Procesar cada archivo (sin generar el informe EDA aquí)
+    for location, (input_path, output_path, output_limpio, metadata) in [
+        ("Salvador", (path_salvador, output_salvador, output_salvador_limpio, metadatos_salvador)),
+        ("Calama", (path_calama, output_calama, output_calama_limpio, metadatos_calama)),
+        ("Vallenar", (path_vallenar, output_vallenar, output_vallenar_limpio, metadatos_vallenar))
+    ]:
+        try:
+            print(f"\nProcesando {location}...")
+            print(f"Leyendo archivo: {input_path}")
+            df = transformar_a_tmy_con_metadatos(input_path, output_path, metadata)
+            print(f"Transformación completada. Limpiando datos...")
+            limpiar_TMY_completo(str(output_path), str(output_limpio), location=location)
+            print(f"Limpieza completada. Eliminando archivos temporales...")
+            for suffix in ["_GHI_limpio.csv", "_DNI_limpio.csv", "_DHI_limpio.csv"]:
+                try:
+                    os.remove(str(output_path).replace("_TMY_artificial.csv", suffix))
+                except FileNotFoundError:
+                    pass
+            print(f"Leyendo archivo limpio...")
+            df_limpio = pd.read_csv(output_limpio, skiprows=2)
+            print(f"Generando gráficos...")
+            plot_tmy_data(df_limpio, location)
+            print(f"Realizando análisis estacional...")
+            analisis_estacional(df_limpio, location)
+            print(f"Eliminando archivo temporal...")
+            try:
+                os.remove(str(output_path))
+            except FileNotFoundError:
+                pass
+            print(f"Procesamiento de {location} completado.")
+        except Exception as e:
+            print(f"Error procesando {location}: {str(e)}")
+            import traceback
+            print(traceback.format_exc())
+
+    # Generar resumen comparativo
+    dfs_limpios = [
+        pd.read_csv(DATOS_LIMPIOS_DIR / "salvador_TMY_limpio.csv", skiprows=2),
+        pd.read_csv(DATOS_LIMPIOS_DIR / "calama_TMY_limpio.csv", skiprows=2),
+        pd.read_csv(DATOS_LIMPIOS_DIR / "vallenar_TMY_limpio.csv", skiprows=2)
+    ]
+    locations = ["Salvador", "Calama", "Vallenar"]
+    if len(dfs_limpios) == 3:
+        print("\nGenerando resumen comparativo...")
+        generar_resumen_comparativo(dfs_limpios, locations)
+        print("\nReconstruyendo archivos TMY limpios con fechas originales...")
+        reconstruir_TMY_con_fechas_originales("salvador_corrupted.csv", DATOS_LIMPIOS_DIR / "salvador_TMY_limpio.csv", DATOS_LIMPIOS_DIR / "salvador_TMY_limpio_originales.csv")
+        reconstruir_TMY_con_fechas_originales("calama_corrupted.csv", DATOS_LIMPIOS_DIR / "calama_TMY_limpio.csv", DATOS_LIMPIOS_DIR / "calama_TMY_limpio_originales.csv")
+        reconstruir_TMY_con_fechas_originales("Vallenar_corrupted.csv", DATOS_LIMPIOS_DIR / "vallenar_TMY_limpio.csv", DATOS_LIMPIOS_DIR / "vallenar_TMY_limpio_originales.csv")
+    else:
+        print(f"\nNo se pudo generar el resumen comparativo. Se procesaron {len(dfs_limpios)} de 3 archivos.")
+
+    # Procesar cada archivo limpio y guardar el resultado final
+    process_and_save_final_tmy(DATOS_LIMPIOS_DIR / 'calama_TMY_limpio_originales.csv', DATOS_LIMPIOS_DIR / 'calama_TMY_final.csv')
+    process_and_save_final_tmy(DATOS_LIMPIOS_DIR / 'salvador_TMY_limpio_originales.csv', DATOS_LIMPIOS_DIR / 'salvador_TMY_final.csv')
+    process_and_save_final_tmy(DATOS_LIMPIOS_DIR / 'vallenar_TMY_limpio_originales.csv', DATOS_LIMPIOS_DIR / 'vallenar_TMY_final.csv')
+
+    # Ahora sí, generar el informe EDA con ambos DataFrames
+    for location in ["Calama", "Salvador", "Vallenar"]:
+        df_limpio = pd.read_csv(DATOS_LIMPIOS_DIR / f"{location.lower()}_TMY_limpio.csv", skiprows=2)
+        df_final = pd.read_csv(DATOS_LIMPIOS_DIR / f"{location.lower()}_TMY_final.csv", skiprows=2)
+        generate_eda_report(df_limpio, location, df_final=df_final)
+
+if __name__ == "__main__":
+    main_tmy()

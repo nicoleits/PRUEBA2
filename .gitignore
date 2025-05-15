@@ -1,0 +1,46 @@
+# Entornos virtuales
+.venv/
+venv/
+env/
+ENV/
+
+# Archivos de configuración de Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Archivos de Jupyter
+.ipynb_checkpoints
+
+# Archivos de datos y resultados
+*.csv
+*.xlsx
+*.h5
+*.hdf5
+*.parquet
+*.feather
+*.pkl
+*.sav
+*.dat
+*.zip
+*.tar.gz
+
+# Carpeta de gráficos y resultados
+graficos_limpieza/
+*.png
+*.jpg
+*.jpeg
+
+# Archivos de logs y reportes
+*.log
+*.txt
+
+# Configuración de VSCode y otros editores
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db 
